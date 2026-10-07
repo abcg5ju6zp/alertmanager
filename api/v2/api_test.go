@@ -1098,9 +1098,13 @@ receivers:
 type putRecorder struct {
 	provider.Alerts
 	stored []*alert.Alert
+	// puts counts the number of Put calls, so tests can assert that a
+	// batch is written in a single call.
+	puts int
 }
 
 func (p *putRecorder) Put(_ context.Context, alerts ...*alert.Alert) error {
+	p.puts++
 	p.stored = append(p.stored, alerts...)
 	return nil
 }
@@ -1266,3 +1270,278 @@ func TestPostAlertsHandlerIngestsFingerprintedAlerts(t *testing.T) {
 		require.Equal(t, 1, count, "fingerprint %v stored %d times", fp, count)
 	}
 }
+
+// TestPostAlertsHandlerRejectsInvalidBatchAtomically checks that a batch
+// containing any invalid alert is rejected as a whole: no alert reaches the
+// provider, Put is not called at all, and the 400 response pinpoints each
+// invalid alert by its position in the request. A fully valid batch is
+// stored in a single Put call.
+func TestPostAlertsHandlerRejectsInvalidBatchAtomically(t *testing.T) {
+	now := time.Now()
+	valid := func(instance string) *open_api_models.PostableAlert {
+		return &open_api_models.PostableAlert{
+			Alert:    open_api_models.Alert{Labels: open_api_models.LabelSet{"alertname": "test", "instance": instance}},
+			StartsAt: strfmt.DateTime(now),
+			EndsAt:   strfmt.DateTime(now.Add(time.Hour)),
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		alerts   open_api_models.PostableAlerts
+		wantErrs []string
+	}{
+		{
+			name: "invalid label value after valid alert",
+			alerts: open_api_models.PostableAlerts{
+				valid("a"),
+				{
+					Alert:    open_api_models.Alert{Labels: open_api_models.LabelSet{"alertname": "test", "x": "\xff"}},
+					StartsAt: strfmt.DateTime(now),
+					EndsAt:   strfmt.DateTime(now.Add(time.Hour)),
+				},
+			},
+			wantErrs: []string{"alert[1]:", "invalid label set", "invalid value"},
+		},
+		{
+			name: "end time before start time after valid alert",
+			alerts: open_api_models.PostableAlerts{
+				valid("a"),
+				{
+					Alert:    open_api_models.Alert{Labels: open_api_models.LabelSet{"alertname": "test"}},
+					StartsAt: strfmt.DateTime(now.Add(time.Hour)),
+					EndsAt:   strfmt.DateTime(now),
+				},
+			},
+			wantErrs: []string{"alert[1]:", "start time must be before end time"},
+		},
+		{
+			name: "missing labels after valid alert",
+			alerts: open_api_models.PostableAlerts{
+				valid("a"),
+				{
+					StartsAt: strfmt.DateTime(now),
+					EndsAt:   strfmt.DateTime(now.Add(time.Hour)),
+				},
+			},
+			wantErrs: []string{"alert[1]:", "at least one label pair required"},
+		},
+		{
+			name: "all invalid alerts are reported with their positions",
+			alerts: open_api_models.PostableAlerts{
+				valid("a"),
+				{StartsAt: strfmt.DateTime(now), EndsAt: strfmt.DateTime(now.Add(time.Hour))},
+				{
+					Alert:    open_api_models.Alert{Labels: open_api_models.LabelSet{"alertname": "test", "x": "\xff"}},
+					StartsAt: strfmt.DateTime(now),
+					EndsAt:   strfmt.DateTime(now.Add(time.Hour)),
+				},
+			},
+			wantErrs: []string{"alert[1]:", "alert[2]:"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stored := &putRecorder{}
+			api := API{
+				alerts: stored,
+				logger: promslog.NewNopLogger(),
+				m:      metrics.NewAlerts(prometheus.NewRegistry()),
+				alertmanagerConfig: &config.Config{
+					Global: &config.GlobalConfig{ResolveTimeout: model.Duration(5 * time.Minute)},
+				},
+			}
+
+			r, err := http.NewRequest("POST", "/api/v2/alerts", nil)
+			require.NoError(t, err)
+			w := httptest.NewRecorder()
+			api.postAlertsHandler(alert_ops.PostAlertsParams{HTTPRequest: r, Alerts: tc.alerts}).WriteResponse(w, runtime.TextProducer())
+
+			require.Equal(t, 400, w.Code, w.Body.String())
+			require.Zero(t, stored.puts, "provider Put must not be called when any alert in the batch is invalid")
+			require.Empty(t, stored.stored, "no alert must be stored when any alert in the batch is invalid")
+			for _, want := range tc.wantErrs {
+				require.Contains(t, w.Body.String(), want)
+			}
+		})
+	}
+
+	// A fully valid batch is stored in one go.
+	stored := &putRecorder{}
+	api := API{
+		alerts: stored,
+		logger: promslog.NewNopLogger(),
+		m:      metrics.NewAlerts(prometheus.NewRegistry()),
+		alertmanagerConfig: &config.Config{
+			Global: &config.GlobalConfig{ResolveTimeout: model.Duration(5 * time.Minute)},
+		},
+	}
+	r, err := http.NewRequest("POST", "/api/v2/alerts", nil)
+	require.NoError(t, err)
+	w := httptest.NewRecorder()
+	api.postAlertsHandler(alert_ops.PostAlertsParams{
+		HTTPRequest: r,
+		Alerts:     open_api_models.PostableAlerts{valid("a"), valid("b")},
+	}).WriteResponse(w, runtime.TextProducer())
+	require.Equal(t, 200, w.Code, w.Body.String())
+	require.Equal(t, 1, stored.puts, "the whole batch must be written with a single Put call")
+	require.Len(t, stored.stored, 2)
+}
+
+// TestPostAlertsHandlerInvalidBatchSendsNoPartialEvents verifies against the
+// real in-memory provider that a rejected batch neither stores alerts nor
+// delivers partial events to subscribers (the dispatcher). Retrying with a
+// corrected batch then stores and dispatches every alert exactly once.
+func TestPostAlertsHandlerInvalidBatchSendsNoPartialEvents(t *testing.T) {
+	alertsProvider, err := mem.NewAlerts(t.Context(), time.Minute, 0, nil, promslog.NewNopLogger(), eventrecorder.NopRecorder(), prometheus.NewRegistry(), nil)
+	require.NoError(t, err)
+	t.Cleanup(alertsProvider.Close)
+
+	api := API{
+		alerts: alertsProvider,
+		logger: promslog.NewNopLogger(),
+		m:      metrics.NewAlerts(prometheus.NewRegistry()),
+		alertmanagerConfig: &config.Config{
+			Global: &config.GlobalConfig{ResolveTimeout: model.Duration(5 * time.Minute)},
+		},
+	}
+	post := func(t *testing.T, postable open_api_models.PostableAlerts) *httptest.ResponseRecorder {
+		t.Helper()
+		r, err := http.NewRequest("POST", "/api/v2/alerts", nil)
+		require.NoError(t, err)
+		w := httptest.NewRecorder()
+		api.postAlertsHandler(alert_ops.PostAlertsParams{HTTPRequest: r, Alerts: postable}).WriteResponse(w, runtime.TextProducer())
+		return w
+	}
+
+	// A subscriber stands in for the dispatcher.
+	sub := alertsProvider.Subscribe("test")
+	defer sub.Close()
+
+	now := time.Now()
+	bad := open_api_models.PostableAlerts{
+		{
+			Alert:    open_api_models.Alert{Labels: open_api_models.LabelSet{"alertname": "good", "instance": "a"}},
+			StartsAt: strfmt.DateTime(now),
+			EndsAt:   strfmt.DateTime(now.Add(time.Hour)),
+		},
+		{
+			Alert:    open_api_models.Alert{Labels: open_api_models.LabelSet{"alertname": "bad", "x": "\xff"}},
+			StartsAt: strfmt.DateTime(now),
+			EndsAt:   strfmt.DateTime(now.Add(time.Hour)),
+		},
+	}
+	w := post(t, bad)
+	require.Equal(t, 400, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "alert[1]")
+
+	// Nothing must be pending in the store.
+	it := alertsProvider.GetPending()
+	select {
+	case pa, ok := <-it.Next():
+		if ok {
+			t.Fatalf("rejected batch stored a pending alert: %v", pa.Data.Labels)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending iterator did not close")
+	}
+	it.Close()
+
+	// The subscriber must not have seen any partial event.
+	select {
+	case pa := <-sub.Next():
+		t.Fatalf("subscriber received an event for a rejected batch: %v", pa.Data.Labels)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Retrying with the corrected batch succeeds and delivers both alerts.
+	fixed := open_api_models.PostableAlerts{
+		bad[0],
+		{
+			Alert:    open_api_models.Alert{Labels: open_api_models.LabelSet{"alertname": "good", "instance": "b"}},
+			StartsAt: strfmt.DateTime(now),
+			EndsAt:   strfmt.DateTime(now.Add(time.Hour)),
+		},
+	}
+	w = post(t, fixed)
+	require.Equal(t, 200, w.Code, w.Body.String())
+
+	for range 2 {
+		select {
+		case <-sub.Next():
+		case <-time.After(time.Second):
+			t.Fatal("subscriber did not receive an event for an alert of the accepted batch")
+		}
+	}
+	select {
+	case pa := <-sub.Next():
+		t.Fatalf("subscriber received an unexpected extra event: %v", pa.Data.Labels)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestPostAlertsHandlerBatchNormalizationSemantics checks that the
+// all-or-nothing validation keeps the existing single-alert semantics:
+// alerts without an end time get the resolve timeout (Timeout=true), alerts
+// with an end time in the past are resolved (Timeout=false), and duplicate
+// fingerprints within one batch both reach the provider in the same Put.
+func TestPostAlertsHandlerBatchNormalizationSemantics(t *testing.T) {
+	const resolveTimeout = 5 * time.Minute
+
+	stored := &putRecorder{}
+	api := API{
+		alerts: stored,
+		logger: promslog.NewNopLogger(),
+		m:      metrics.NewAlerts(prometheus.NewRegistry()),
+		alertmanagerConfig: &config.Config{
+			Global: &config.GlobalConfig{ResolveTimeout: model.Duration(resolveTimeout)},
+		},
+	}
+
+	start := time.Now()
+	postable := open_api_models.PostableAlerts{
+		// No end time: StartsAt and EndsAt are defaulted and the alert
+		// carries the timeout marker.
+		{
+			Alert: open_api_models.Alert{Labels: open_api_models.LabelSet{"alertname": "timed"}},
+		},
+		// Explicit end time in the past: a resolved alert without timeout.
+		{
+			Alert:    open_api_models.Alert{Labels: open_api_models.LabelSet{"alertname": "resolved"}},
+			StartsAt: strfmt.DateTime(start.Add(-2 * time.Hour)),
+			EndsAt:   strfmt.DateTime(start.Add(-time.Hour)),
+		},
+		// Same fingerprint as the first alert, posted again within the same
+		// batch. Both must reach Put so the provider merge path is taken.
+		{
+			Alert:    open_api_models.Alert{Labels: open_api_models.LabelSet{"alertname": "timed"}},
+			StartsAt: strfmt.DateTime(start),
+			EndsAt:   strfmt.DateTime(start.Add(time.Hour)),
+		},
+	}
+
+	r, err := http.NewRequest("POST", "/api/v2/alerts", nil)
+	require.NoError(t, err)
+	w := httptest.NewRecorder()
+	api.postAlertsHandler(alert_ops.PostAlertsParams{HTTPRequest: r, Alerts: postable}).WriteResponse(w, runtime.TextProducer())
+	require.Equal(t, 200, w.Code, w.Body.String())
+
+	require.Equal(t, 1, stored.puts)
+	require.Len(t, stored.stored, 3)
+
+	timed, resolved, duplicate := stored.stored[0], stored.stored[1], stored.stored[2]
+	require.True(t, timed.Timeout)
+	require.WithinDuration(t, time.Now(), timed.StartsAt, time.Second)
+	require.WithinDuration(t, time.Now().Add(resolveTimeout), timed.EndsAt, time.Second)
+
+	require.False(t, resolved.Timeout)
+	require.True(t, resolved.Resolved())
+	require.Equal(t, start.Add(-2*time.Hour), resolved.StartsAt)
+	require.Equal(t, start.Add(-time.Hour), resolved.EndsAt)
+
+	// The duplicate reaches the same Put call with the same fingerprint.
+	require.Equal(t, timed.Fingerprint(), duplicate.Fingerprint())
+	require.False(t, duplicate.Timeout)
+	require.Equal(t, start, duplicate.StartsAt)
+	require.Equal(t, start.Add(time.Hour), duplicate.EndsAt)
+}
+

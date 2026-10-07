@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "批量请求中的任一告警校验失败时，整批都不进入告警存储。"
+  - id: 2
+    type: f2p
+    text: "校验失败的批量请求不会向 dispatcher、inhibitor 或事件记录发送其中任何一条告警事件。"
+  - id: 3
+    type: f2p
+    text: "批量失败响应保留每条无效告警的可定位校验错误，并返回现有的客户端错误结果。"
+  - id: 4
+    type: f2p
+    text: "所有告警通过归一化和校验后才一次性写入，整批有效告警都能被后续分发读取。"
+  - id: 5
+    type: f2p
+    text: "同一批中重复 fingerprint 的告警仍按既有 Merge 规则合并，不因原子校验改变时间和注释结果。"
+  - id: 6
+    type: p2p
+    text: "缺少结束时间时的 resolve timeout、显式已解决告警和 StartsAt 归一化保持原有可观察行为。"
+  - id: 7
+    type: p2p
+    text: "全量有效的单条和多条 v2 上报仍返回原有成功结果，既有 listener 与指标行为保持兼容。"

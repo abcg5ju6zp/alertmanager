@@ -365,7 +365,12 @@ func (api *API) postAlertsHandler(params alert_ops.PostAlertsParams) middleware.
 	resolveTimeout := time.Duration(api.alertmanagerConfig.Global.ResolveTimeout)
 	api.mtx.RUnlock()
 
-	// Make a best effort to insert all alerts that are valid.
+	// Normalize and validate the whole batch before writing anything. If
+	// even a single alert is invalid the request must fail without storing
+	// any of the alerts or notifying subscribers: a partial write followed
+	// by a 400 makes a caller retry the full batch, which duplicates
+	// notifications while the dispatcher has already observed alerts the
+	// server reported as rejected.
 	var (
 		validAlerts    = make([]*alert.Alert, 0, len(alerts))
 		validationErrs error
@@ -387,29 +392,19 @@ func (api *API) postAlertsHandler(params alert_ops.PostAlertsParams) middleware.
 			timeout = true
 			alrt.EndsAt = now.Add(resolveTimeout)
 		}
-		if alrt.EndsAt.After(time.Now()) {
-			api.m.Firing().Inc()
-		} else {
-			api.m.Resolved().Inc()
-		}
 
 		removeEmptyLabels(alrt.Labels)
 
 		if err := alert.Validate(alrt); err != nil {
-			validationErrs = errors.Join(validationErrs, err)
+			// Prefix the error with the alert's position in the request so
+			// callers can locate the offending alert.
+			validationErrs = errors.Join(validationErrs, fmt.Errorf("alert[%d]: %w", i, err))
 			api.m.Invalid().Inc()
 			continue
 		}
 		// Labels are final at this point, so the alert can be fingerprinted
 		// and become an internal alert.
 		validAlerts = append(validAlerts, alert.New(*alrt, now, timeout))
-	}
-	if err := api.alerts.Put(ctx, validAlerts...); err != nil {
-		message := "Failed to create alerts"
-		logger.Error(message, "err", err)
-		span.SetStatus(codes.Error, message)
-		span.RecordError(err)
-		return alert_ops.NewPostAlertsInternalServerError().WithPayload(err.Error())
 	}
 
 	if validationErrs != nil {
@@ -418,6 +413,24 @@ func (api *API) postAlertsHandler(params alert_ops.PostAlertsParams) middleware.
 		span.SetStatus(codes.Error, message)
 		span.RecordError(validationErrs)
 		return alert_ops.NewPostAlertsBadRequest().WithPayload(validationErrs.Error())
+	}
+
+	// The whole batch passed validation, so account for and store it in a
+	// single put.
+	for _, alrt := range validAlerts {
+		if alrt.EndsAt.After(now) {
+			api.m.Firing().Inc()
+		} else {
+			api.m.Resolved().Inc()
+		}
+	}
+
+	if err := api.alerts.Put(ctx, validAlerts...); err != nil {
+		message := "Failed to create alerts"
+		logger.Error(message, "err", err)
+		span.SetStatus(codes.Error, message)
+		span.RecordError(err)
+		return alert_ops.NewPostAlertsInternalServerError().WithPayload(err.Error())
 	}
 
 	return alert_ops.NewPostAlertsOK()

@@ -1,0 +1,16 @@
+项目：prometheus-alertmanager｜题目 ID：prometheus-alertmanager-ae7ba3ed-fa2f-4d83-b169-03ad24895479
+固定基线：b9407e4c8d4c14ccb030301f7d1529eb39fbb2af｜Session：586499748533644:cd738c8ddf90d13b62e2659e6336400d_6ac6042d7e3ad4c77d0fdf86.6ac6042d7e3ad4c77d0fdf89.6ac6042d7e3ad4c77d0fdf87:TraeCode CN.3.3.104.no_sid.no_ppe.T(2026/10/7 16:34:53)
+Harness：Trae｜有效轮数：39｜来源：count-trae-cn-steps.py｜范围：latest_turn
+完成度：完成｜收录结论：不收录
+验证命令：go test -count=1 ./api/v2
+
+Rubric ID：1｜状态：通过｜期望行为：批量请求中的任一告警校验失败时，整批都不进入告警存储。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/v2/api.go; api/v2/api_test.go；go test -count=1 ./api/v2
+Rubric ID：2｜状态：通过｜期望行为：校验失败的批量请求不会向 dispatcher、inhibitor 或事件记录发送其中任何一条告警事件。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/v2/api.go; api/v2/api_test.go；go test -count=1 ./api/v2
+Rubric ID：3｜状态：通过｜期望行为：批量失败响应保留每条无效告警的可定位校验错误，并返回现有的客户端错误结果。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/v2/api.go; api/v2/api_test.go；go test -count=1 ./api/v2
+Rubric ID：4｜状态：通过｜期望行为：所有告警通过归一化和校验后才一次性写入，整批有效告警都能被后续分发读取。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/v2/api.go; api/v2/api_test.go；go test -count=1 ./api/v2
+Rubric ID：5｜状态：通过｜期望行为：同一批中重复 fingerprint 的告警仍按既有 Merge 规则合并，不因原子校验改变时间和注释结果。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/v2/api.go; api/v2/api_test.go；go test -count=1 ./api/v2
+Rubric ID：6｜状态：通过｜期望行为：缺少结束时间时的 resolve timeout、显式已解决告警和 StartsAt 归一化保持原有可观察行为。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/v2/api.go; api/v2/api_test.go；go test -count=1 ./api/v2
+Rubric ID：7｜状态：通过｜期望行为：全量有效的单条和多条 v2 上报仍返回原有成功结果，既有 listener 与指标行为保持兼容。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/v2/api.go; api/v2/api_test.go；go test -count=1 ./api/v2
+
+Prompt-Rubric 对齐：冻结 Prompt 已拆分为入口、状态、失败恢复、重启、并发和兼容性要求；每条 Rubric 均可回指原始 Prompt，未增加接口、文件、错误码、性能或部署条件。
+审计边界：仅使用本题固定版本、一次 Session、冻结 Rubric 和当前项目改动；未使用其他题目、其他 Session 或重跑材料替代原始运行事实。
