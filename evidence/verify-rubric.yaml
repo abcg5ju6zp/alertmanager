@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "快照固定 receiver、group key、firing/resolved/muted 条目和 expiry 的同一代际。"
+  - id: 2
+    type: f2p
+    text: "候选完成编码、过期裁剪和完整性校验后才替换当前日志。"
+  - id: 3
+    type: f2p
+    text: "快照写入、同步或进程退出失败时上一份日志仍能完成去重查询。"
+  - id: 4
+    type: f2p
+    text: "重启会继续或清理候选，最近已确认通知不会因快照丢失而重复发送。"
+  - id: 5
+    type: f2p
+    text: "HA Merge 只接受较新且未过期的条目，迟到旧快照不能回退状态。"
+  - id: 6
+    type: p2p
+    text: "GC、Query 和 DedupStage 不会读取半快照或混合内存候选。"
+  - id: 7
+    type: p2p
+    text: "空日志、receiver/group key、集群协议和正常通知发送保持兼容。"

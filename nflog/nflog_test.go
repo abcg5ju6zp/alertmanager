@@ -15,7 +15,6 @@ package nflog
 
 import (
 	"bytes"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -194,32 +193,300 @@ alertmanager_nflog_maintenance_total 2
 	})
 }
 
-func TestReplaceFile(t *testing.T) {
-	dir, err := os.MkdirTemp("", "replace_file")
-	require.NoError(t, err, "creating temp dir failed")
+func TestSnapshotEnvelope(t *testing.T) {
+	payload := []byte("some length-delimited payload")
 
-	origFilename := filepath.Join(dir, "testfile")
+	blob := encodeSnapshot(payload)
+	require.True(t, bytes.HasPrefix(blob, snapshotMagicV1), "envelope must start with the magic")
 
-	of, err := os.Create(origFilename)
-	require.NoError(t, err, "creating file failed")
+	got, err := decodeSnapshotBlob(blob)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
 
-	nf, err := openReplace(origFilename)
-	require.NoError(t, err, "opening replacement file failed")
+	// Raw bytes without the magic are returned unchanged for snapshots
+	// written by older Alertmanager versions.
+	legacy := []byte("legacy raw snapshot")
+	got, err = decodeSnapshotBlob(legacy)
+	require.NoError(t, err)
+	require.Equal(t, legacy, got)
 
-	_, err = nf.Write([]byte("test"))
-	require.NoError(t, err, "writing replace file failed")
+	// A flipped checksum byte is detected.
+	tampered := bytes.Clone(blob)
+	tampered[len(tampered)-1] ^= 0xff
+	_, err = decodeSnapshotBlob(tampered)
+	require.ErrorIs(t, err, ErrSnapshotCorrupt)
 
-	require.NotEqual(t, nf.Name(), of.Name(), "replacement file must have different name while editing")
-	require.NoError(t, nf.Close(), "closing replacement file failed")
-	require.NoError(t, of.Close(), "closing original file failed")
+	// A truncated envelope is detected.
+	_, err = decodeSnapshotBlob(append(bytes.Clone(snapshotMagicV1), 0x00))
+	require.ErrorIs(t, err, ErrSnapshotCorrupt)
+}
 
-	ofr, err := os.Open(origFilename)
-	require.NoError(t, err, "opening original file failed")
-	defer ofr.Close()
+func newFileLog(t *testing.T, snapshotFile string) *Log {
+	t.Helper()
+	l, err := New(Options{
+		Metrics:      prometheus.NewRegistry(),
+		SnapshotFile: snapshotFile,
+		Retention:    time.Hour,
+	})
+	require.NoError(t, err)
+	return l
+}
 
-	res, err := io.ReadAll(ofr)
-	require.NoError(t, err, "reading original file failed")
-	require.Equal(t, "test", string(res), "unexpected file contents")
+func fileLogEntry(groupName, gkey string, ts time.Time) *pb.MeshEntry {
+	recv := &pb.Receiver{GroupName: groupName, Integration: "test", Idx: 1}
+	return &pb.MeshEntry{
+		Entry: &pb.Entry{
+			GroupKey:  []byte(gkey),
+			Receiver:  recv,
+			Timestamp: timestamppb.New(ts),
+		},
+		ExpiresAt: timestamppb.New(ts.Add(time.Hour)),
+	}
+}
+
+// TestSnapshotFileCommitAndReload checks that writeSnapshotFile leaves only a
+// committed snapshot file and that a fresh Log instance recovers it.
+func TestSnapshotFileCommitAndReload(t *testing.T) {
+	snap := filepath.Join(t.TempDir(), "nflog")
+	l := newFileLog(t, snap)
+
+	now := time.Now()
+	e := fileLogEntry("a1", "key", now)
+	l.st[stateKey("key", e.Entry.Receiver)] = e
+
+	size, err := l.writeSnapshotFile(snap)
+	require.NoError(t, err)
+	require.Positive(t, size)
+	require.EqualValues(t, 1, l.generation.Load())
+
+	_, err = os.Stat(snapshotCandidatePath(snap))
+	require.ErrorIs(t, err, os.ErrNotExist, "candidate must not linger after commit")
+
+	l2 := newFileLog(t, snap)
+	entries, err := l2.Query(QGroupKey("key"), QReceiver(e.Entry.Receiver))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, proto.Equal(e.Entry, entries[0]))
+}
+
+// TestSnapshotFileEmpty checks that an empty log produces a loadable empty
+// snapshot.
+func TestSnapshotFileEmpty(t *testing.T) {
+	snap := filepath.Join(t.TempDir(), "nflog")
+	l := newFileLog(t, snap)
+
+	size, err := l.writeSnapshotFile(snap)
+	require.NoError(t, err)
+	// Logical payload is empty; the envelope still lands on disk.
+	require.Zero(t, size)
+	info, err := os.Stat(snap)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(snapshotMagicV1)+4), info.Size())
+
+	l2 := newFileLog(t, snap)
+	require.Empty(t, l2.st)
+}
+
+// TestSnapshotFilePrunesExpired checks that expired entries never reach the
+// committed snapshot even when GC has not run yet.
+func TestSnapshotFilePrunesExpired(t *testing.T) {
+	snap := filepath.Join(t.TempDir(), "nflog")
+	l := newFileLog(t, snap)
+
+	now := time.Now()
+	live := fileLogEntry("live", "g1", now)
+	expired := fileLogEntry("expired", "g2", now.Add(-2*time.Hour))
+	expired.ExpiresAt = timestamppb.New(now.Add(-time.Second))
+
+	l.st[stateKey("g1", live.Entry.Receiver)] = live
+	l.st[stateKey("g2", expired.Entry.Receiver)] = expired
+
+	_, err := l.writeSnapshotFile(snap)
+	require.NoError(t, err)
+
+	st, err := verifySnapshotFile(snap)
+	require.NoError(t, err)
+	require.Contains(t, st, stateKey("g1", live.Entry.Receiver))
+	require.NotContains(t, st, stateKey("g2", expired.Entry.Receiver))
+
+	l2 := newFileLog(t, snap)
+	_, err = l2.Query(QGroupKey("g2"), QReceiver(expired.Entry.Receiver))
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestSnapshotFileFailureKeepsPrevious checks that a failed write does not
+// touch the last valid snapshot generation.
+func TestSnapshotFileFailureKeepsPrevious(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "nflog")
+	l := newFileLog(t, snap)
+
+	e := fileLogEntry("a1", "key", time.Now())
+	l.st[stateKey("key", e.Entry.Receiver)] = e
+	_, err := l.writeSnapshotFile(snap)
+	require.NoError(t, err)
+
+	// A target in a nonexistent directory can never get a candidate.
+	bad := filepath.Join(dir, "missing", "nflog")
+	_, err = l.writeSnapshotFile(bad)
+	require.Error(t, err)
+
+	_, err = os.Stat(snapshotCandidatePath(bad))
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	// The previous generation still loads.
+	l2 := newFileLog(t, snap)
+	entries, err := l2.Query(QGroupKey("key"), QReceiver(e.Entry.Receiver))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+}
+
+// TestSnapshotFileRecoverCompletedCandidate simulates a crash after the
+// candidate was fully written and synced but before it replaced the current
+// file: restart promotes the candidate.
+func TestSnapshotFileRecoverCompletedCandidate(t *testing.T) {
+	snap := filepath.Join(t.TempDir(), "nflog")
+
+	// First generation on disk, containing the older entry.
+	l := newFileLog(t, snap)
+	old := fileLogEntry("a1", "key", time.Now().Add(-time.Hour))
+	// The older notification must not look expired: its entry timestamp is
+	// older while retention keeps it alive.
+	old.ExpiresAt = timestamppb.New(time.Now().Add(time.Hour))
+	l.st[stateKey("key", old.Entry.Receiver)] = old
+	_, err := l.writeSnapshotFile(snap)
+	require.NoError(t, err)
+
+	// A completed candidate carrying the newer generation.
+	next := fileLogEntry("a1", "key", time.Now())
+	payload, err := state{stateKey("key", next.Entry.Receiver): next}.MarshalBinary()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(snapshotCandidatePath(snap), encodeSnapshot(payload), 0o600))
+
+	l2 := newFileLog(t, snap)
+
+	_, err = os.Stat(snapshotCandidatePath(snap))
+	require.ErrorIs(t, err, os.ErrNotExist, "candidate must be resolved on restart")
+
+	entries, err := l2.Query(QGroupKey("key"), QReceiver(next.Entry.Receiver))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, proto.Equal(next.Entry, entries[0]), "newer candidate generation must be recovered")
+
+	// Another restart stays on the promoted generation.
+	l3 := newFileLog(t, snap)
+	entries, err = l3.Query(QGroupKey("key"), QReceiver(next.Entry.Receiver))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, proto.Equal(next.Entry, entries[0]))
+}
+
+// TestSnapshotFileDiscardCorruptCandidate checks that a torn candidate write
+// is discarded on restart while the previous valid snapshot is preserved.
+func TestSnapshotFileDiscardCorruptCandidate(t *testing.T) {
+	snap := filepath.Join(t.TempDir(), "nflog")
+
+	l := newFileLog(t, snap)
+	old := fileLogEntry("a1", "key", time.Now().Add(-time.Hour))
+	old.ExpiresAt = timestamppb.New(time.Now().Add(time.Hour))
+	l.st[stateKey("key", old.Entry.Receiver)] = old
+	_, err := l.writeSnapshotFile(snap)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(snapshotCandidatePath(snap), []byte("partial write"), 0o600))
+
+	l2 := newFileLog(t, snap)
+
+	_, err = os.Stat(snapshotCandidatePath(snap))
+	require.ErrorIs(t, err, os.ErrNotExist, "corrupt candidate must be removed on restart")
+
+	entries, err := l2.Query(QGroupKey("key"), QReceiver(old.Entry.Receiver))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, proto.Equal(old.Entry, entries[0]), "previous valid snapshot must be preserved")
+
+	// A candidate with a valid envelope but undecodable payload is rejected
+	// by the verification step itself.
+	bad := encodeSnapshot([]byte("not a protobuf stream"))
+	require.NoError(t, os.WriteFile(snapshotCandidatePath(snap), bad, 0o600))
+	_, err = verifySnapshotFile(snapshotCandidatePath(snap))
+	require.Error(t, err)
+}
+
+// TestSnapshotFileLegacyFormats checks that raw snapshots and random temp
+// files left by older Alertmanager versions are handled on restart.
+func TestSnapshotFileLegacyFormats(t *testing.T) {
+	t.Run("raw snapshot loads", func(t *testing.T) {
+		snap := filepath.Join(t.TempDir(), "nflog")
+
+		e := fileLogEntry("a1", "key", time.Now())
+		st := state{stateKey("key", e.Entry.Receiver): e}
+		f, err := os.Create(snap)
+		require.NoError(t, err)
+		_, err = (&Log{st: st.clone(), metrics: newMetrics(nil)}).Snapshot(f)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		l := newFileLog(t, snap)
+		entries, err := l.Query(QGroupKey("key"), QReceiver(e.Entry.Receiver))
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		require.True(t, proto.Equal(e.Entry, entries[0]))
+	})
+
+	t.Run("stale random temp is removed", func(t *testing.T) {
+		dir := t.TempDir()
+		snap := filepath.Join(dir, "nflog")
+
+		require.NoError(t, os.WriteFile(snap+".deadbeef", []byte("crashed temp"), 0o600))
+		require.NoError(t, os.WriteFile(snap+".bak", []byte("operator backup"), 0o600))
+
+		_ = newFileLog(t, snap)
+
+		_, err := os.Stat(snap + ".deadbeef")
+		require.ErrorIs(t, err, os.ErrNotExist, "legacy temp file must be cleaned up")
+		_, err = os.Stat(snap + ".bak")
+		require.NoError(t, err, "operator-managed files must be left alone")
+	})
+}
+
+// TestMaintenanceWritesRecoverableSnapshot runs the real maintenance loop and
+// checks that a fresh Log instance resumes from its snapshot file.
+func TestMaintenanceWritesRecoverableSnapshot(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		snap := filepath.Join(t.TempDir(), "nflog")
+		stopc := make(chan struct{})
+		reg := prometheus.NewPedanticRegistry()
+
+		l, err := New(Options{
+			Metrics:      reg,
+			SnapshotFile: snap,
+			Retention:    time.Hour,
+		})
+		require.NoError(t, err)
+
+		recv := &pb.Receiver{GroupName: "a1", Integration: "test", Idx: 1}
+		require.NoError(t, l.Log(recv, "key", []uint64{1}, nil, nil, nil, 0))
+
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			l.Maintenance(100*time.Millisecond, snap, stopc, nil)
+		})
+		synctest.Wait()
+		time.Sleep(101 * time.Millisecond)
+		synctest.Wait()
+		close(stopc)
+		wg.Wait()
+
+		_, err = os.Stat(snapshotCandidatePath(snap))
+		require.ErrorIs(t, err, os.ErrNotExist)
+
+		l2 := newFileLog(t, snap)
+		entries, err := l2.Query(QGroupKey("key"), QReceiver(recv))
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		require.Equal(t, []uint64{1}, entries[0].FiringAlerts)
+	})
 }
 
 func TestStateMerge(t *testing.T) {
@@ -467,4 +734,83 @@ func TestStateDecodingError(t *testing.T) {
 
 	_, err = decodeState(bytes.NewReader(msg))
 	require.Equal(t, ErrInvalidState, err)
+}
+
+// TestMergeNeverRollsBack checks the cluster merge path: entries from an old
+// snapshot neither roll a current entry back nor resurrect expired or
+// malformed entries, while genuinely newer entries are accepted.
+func TestMergeNeverRollsBack(t *testing.T) {
+	now := time.Now()
+
+	recv := func(name string) *pb.Receiver {
+		return &pb.Receiver{GroupName: name, Integration: "test", Idx: 1}
+	}
+	entry := func(name string, ts, exp time.Time) *pb.MeshEntry {
+		return &pb.MeshEntry{
+			Entry: &pb.Entry{
+				GroupKey:  []byte("key"),
+				Receiver:  recv(name),
+				Timestamp: timestamppb.New(ts),
+			},
+			ExpiresAt: timestamppb.New(exp),
+		}
+	}
+
+	encode := func(entries ...*pb.MeshEntry) []byte {
+		st := state{}
+		for _, e := range entries {
+			st[stateKey("key", e.Entry.Receiver)] = e
+		}
+		b, err := st.MarshalBinary()
+		require.NoError(t, err)
+		return b
+	}
+
+	t.Run("older, equal, expired and zero-expiry entries are rejected", func(t *testing.T) {
+		l, err := New(Options{Metrics: prometheus.NewRegistry(), Retention: time.Hour})
+		require.NoError(t, err)
+
+		current := entry("a1", now, now.Add(time.Hour))
+		l.st[stateKey("key", current.Entry.Receiver)] = current
+
+		older := entry("a1", now.Add(-time.Minute), now.Add(time.Hour))
+		equal := entry("a1", now, now.Add(time.Hour))
+		expiredNewKey := entry("a2", now.Add(-time.Hour), now.Add(-time.Millisecond))
+		zeroExpiry := entry("a3", now.Add(time.Minute), time.Time{})
+
+		require.NoError(t, l.Merge(encode(older, equal, expiredNewKey, zeroExpiry)))
+
+		got := l.st[stateKey("key", current.Entry.Receiver)]
+		require.True(t, proto.Equal(current, got), "current entry must not be rolled back")
+		require.NotContains(t, l.st, stateKey("key", recv("a2")), "expired entry must not be resurrected")
+		require.NotContains(t, l.st, stateKey("key", recv("a3")), "zero-expiry entry must be rejected")
+	})
+
+	t.Run("newer entry is accepted and stays queryable", func(t *testing.T) {
+		l, err := New(Options{Metrics: prometheus.NewRegistry(), Retention: time.Hour})
+		require.NoError(t, err)
+
+		current := entry("a1", now, now.Add(time.Hour))
+		l.st[stateKey("key", current.Entry.Receiver)] = current
+
+		newer := entry("a1", now.Add(time.Minute), now.Add(2*time.Hour))
+		require.NoError(t, l.Merge(encode(newer)))
+
+		entries, qerr := l.Query(QGroupKey("key"), QReceiver(recv("a1")))
+		require.NoError(t, qerr)
+		require.Len(t, entries, 1)
+		require.True(t, proto.Equal(newer.Entry, entries[0]))
+	})
+
+	t.Run("new unexpired key is accepted", func(t *testing.T) {
+		l, err := New(Options{Metrics: prometheus.NewRegistry(), Retention: time.Hour})
+		require.NoError(t, err)
+
+		fresh := entry("a1", now, now.Add(time.Hour))
+		require.NoError(t, l.Merge(encode(fresh)))
+
+		entries, qerr := l.Query(QGroupKey("key"), QReceiver(recv("a1")))
+		require.NoError(t, qerr)
+		require.Len(t, entries, 1)
+	})
 }

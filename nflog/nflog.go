@@ -20,14 +20,18 @@ package nflog
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"maps"
-	"math/rand"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -45,6 +49,26 @@ var ErrNotFound = errors.New("not found")
 
 // ErrInvalidState is returned if the state isn't valid.
 var ErrInvalidState = errors.New("invalid state")
+
+// ErrSnapshotCorrupt is returned if a snapshot file fails its integrity
+// check.
+var ErrSnapshotCorrupt = errors.New("corrupt notification log snapshot")
+
+// snapshotMagicV1 prefixes every crash-recoverable snapshot generation. A
+// snapshot file is laid out as:
+//
+//	magic | payload | CRC-32 checksum
+//
+// The payload is the same length-delimited stream of MeshEntry messages used
+// by the cluster protocol. The magic keeps the envelope distinguishable from
+// snapshots written by older Alertmanager versions, which contain the raw
+// payload and keep loading unchanged.
+var snapshotMagicV1 = []byte("AMNFLOG1")
+
+// snapshotCandidateSuffix is appended to the snapshot file name while a new
+// generation is being encoded and verified. The fixed name lets a restarting
+// process resolve the candidate instead of accumulating stale temp files.
+const snapshotCandidateSuffix = ".candidate"
 
 // query currently allows filtering by and/or receiver group key.
 // It is configured via QueryParameter functions.
@@ -182,6 +206,10 @@ type Log struct {
 	mtx       sync.RWMutex
 	st        state
 	broadcast func([]byte)
+
+	// generation counts snapshot generations that were durably committed
+	// to disk. It is only meaningful when a snapshot file is configured.
+	generation atomic.Uint64
 }
 
 // MaintenanceFunc represents the function to run as part of the periodic maintenance for the nflog.
@@ -259,14 +287,30 @@ func (s state) clone() state {
 
 // merge returns true or false whether the MeshEntry was merged or
 // not. This information is used to decide to gossip the message further.
+//
+// An entry is only ever accepted if it is valid, unexpired and strictly
+// newer than the entry currently stored for its key. Entries from an old
+// snapshot can therefore neither resurrect a key that garbage collection
+// removed nor roll a present entry back to an older version.
 func (s state) merge(e *pb.MeshEntry, now time.Time) bool {
-	if e.ExpiresAt.AsTime().Before(now) {
+	if e == nil || e.Entry == nil || e.Entry.Receiver == nil {
+		return false
+	}
+	expiresAt := e.ExpiresAt.AsTime()
+	if expiresAt.IsZero() || expiresAt.Before(now) {
 		return false
 	}
 	k := stateKey(string(e.Entry.GroupKey), e.Entry.Receiver)
 
 	prev, ok := s[k]
-	if !ok || prev.Entry.Timestamp.AsTime().Before(e.Entry.Timestamp.AsTime()) {
+	if !ok {
+		s[k] = e
+		return true
+	}
+	// Only a strictly newer timestamp may replace the current entry.
+	// Equal timestamps are ignored so a retransmitted entry cannot reset
+	// an equally new, possibly richer entry.
+	if prev.Entry.Timestamp.AsTime().Before(e.Entry.Timestamp.AsTime()) {
 		s[k] = e
 		return true
 	}
@@ -277,6 +321,24 @@ func (s state) MarshalBinary() ([]byte, error) {
 	var buf bytes.Buffer
 
 	for _, e := range s {
+		if _, err := protodelim.MarshalTo(&buf, e); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+// marshalBinaryPruned serializes all entries that have not expired at now.
+// It never mutates state, which lets a snapshot candidate omit entries that
+// expired since the last garbage collection cycle.
+func (s state) marshalBinaryPruned(now time.Time) ([]byte, error) {
+	var buf bytes.Buffer
+
+	for _, e := range s {
+		expiresAt := e.ExpiresAt.AsTime()
+		if expiresAt.IsZero() || !expiresAt.After(now) {
+			continue
+		}
 		if _, err := protodelim.MarshalTo(&buf, e); err != nil {
 			return nil, err
 		}
@@ -356,14 +418,23 @@ func New(o Options) (*Log, error) {
 	}
 
 	if o.SnapshotFile != "" {
+		// Resolve a candidate left behind by a crashed snapshot write
+		// before opening the current snapshot file.
+		if err := l.recoverSnapshotFile(o.SnapshotFile); err != nil {
+			return nil, err
+		}
+
 		if r, err := os.Open(o.SnapshotFile); err != nil {
 			if !os.IsNotExist(err) {
 				return nil, err
 			}
 			l.logger.Debug("notification log snapshot file doesn't exist", "err", err)
 		} else {
-			o.SnapshotReader = r
-			defer r.Close()
+			err := l.loadSnapshotFile(r)
+			_ = r.Close()
+			if err != nil {
+				return l, err
+			}
 		}
 	}
 
@@ -394,22 +465,13 @@ func (l *Log) Maintenance(interval time.Duration, snapf string, stopc <-chan str
 
 	var doMaintenance MaintenanceFunc
 	doMaintenance = func() (int64, error) {
-		var size int64
 		if _, err := l.GC(); err != nil {
-			return size, err
+			return 0, err
 		}
 		if snapf == "" {
-			return size, nil
+			return 0, nil
 		}
-		f, err := openReplace(snapf)
-		if err != nil {
-			return size, err
-		}
-		if size, err = l.Snapshot(f); err != nil {
-			f.Close()
-			return size, err
-		}
-		return size, f.Close()
+		return l.writeSnapshotFile(snapf)
 	}
 
 	if override != nil {
@@ -583,6 +645,21 @@ func (l *Log) loadSnapshot(r io.Reader) error {
 	return nil
 }
 
+// loadSnapshotFile loads a snapshot file into the state. Both the
+// checksummed snapshot envelope and the legacy raw stream format are
+// accepted.
+func (l *Log) loadSnapshotFile(f *os.File) error {
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+	payload, err := decodeSnapshotBlob(b)
+	if err != nil {
+		return err
+	}
+	return l.loadSnapshot(bytes.NewReader(payload))
+}
+
 // Snapshot implements the Log interface.
 func (l *Log) Snapshot(w io.Writer) (int64, error) {
 	start := time.Now()
@@ -639,34 +716,202 @@ func (l *Log) SetBroadcast(f func([]byte)) {
 	l.mtx.Unlock()
 }
 
-// replaceFile wraps a file that is moved to another filename on closing.
-type replaceFile struct {
-	*os.File
-	filename string
+func snapshotCandidatePath(filename string) string {
+	return filename + snapshotCandidateSuffix
 }
 
-func (f *replaceFile) Close() error {
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	if err := f.File.Close(); err != nil {
-		return err
-	}
-	return os.Rename(f.Name(), f.filename)
+// encodeSnapshot wraps the raw state payload in the recoverable snapshot
+// envelope: a magic prefix and a trailing CRC-32 checksum of the payload.
+func encodeSnapshot(payload []byte) []byte {
+	b := make([]byte, 0, len(snapshotMagicV1)+len(payload)+crc32.Size)
+	b = append(b, snapshotMagicV1...)
+	b = append(b, payload...)
+
+	var checksum [crc32.Size]byte
+	binary.BigEndian.PutUint32(checksum[:], crc32.ChecksumIEEE(payload))
+	return append(b, checksum[:]...)
 }
 
-// openReplace opens a new temporary file that is moved to filename on closing.
-func openReplace(filename string) (*replaceFile, error) {
-	tmpFilename := fmt.Sprintf("%s.%x", filename, uint64(rand.Int63()))
+// decodeSnapshotBlob validates the snapshot envelope and returns its raw
+// payload. Bytes without the envelope magic are returned unchanged so that
+// snapshots written by older Alertmanager versions keep loading.
+func decodeSnapshotBlob(b []byte) ([]byte, error) {
+	if !bytes.HasPrefix(b, snapshotMagicV1) {
+		return b, nil
+	}
+	if len(b) < len(snapshotMagicV1)+crc32.Size {
+		return nil, ErrSnapshotCorrupt
+	}
+	split := len(b) - crc32.Size
+	payload := b[len(snapshotMagicV1):split]
+	if binary.BigEndian.Uint32(b[split:]) != crc32.ChecksumIEEE(payload) {
+		return nil, ErrSnapshotCorrupt
+	}
+	return payload, nil
+}
 
-	f, err := os.Create(tmpFilename)
+// verifySnapshotFile reads a snapshot candidate, validates its checksum and
+// fully decodes its payload. Only a file for which both checks succeed may
+// replace the current snapshot generation.
+func verifySnapshotFile(filename string) (state, error) {
+	b, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
-
-	rf := &replaceFile{
-		File:     f,
-		filename: filename,
+	payload, err := decodeSnapshotBlob(b)
+	if err != nil {
+		return nil, err
 	}
-	return rf, nil
+	st, err := decodeState(bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+// writeSnapshotFile commits a new snapshot generation to filename. Expired
+// entries are pruned and the encoded candidate is synced, checksummed and
+// fully decoded from disk before it atomically replaces the current file.
+// If encoding, syncing or verification fails, the candidate is discarded and
+// the previous snapshot file is left untouched.
+func (l *Log) writeSnapshotFile(filename string) (int64, error) {
+	start := l.now()
+	defer func() { l.metrics.snapshotDuration.Observe(l.now().Sub(start).Seconds()) }()
+
+	now := l.now()
+
+	l.mtx.RLock()
+	payload, err := l.st.marshalBinaryPruned(now)
+	l.mtx.RUnlock()
+	if err != nil {
+		return 0, err
+	}
+
+	candidate := snapshotCandidatePath(filename)
+
+	// abort discards the candidate. The committed snapshot generation is
+	// never touched on failure.
+	abort := func(cause error) (int64, error) {
+		if err := os.Remove(candidate); err != nil && !os.IsNotExist(err) {
+			l.logger.Debug("failed to remove snapshot candidate", "file", candidate, "err", err)
+		}
+		return 0, cause
+	}
+
+	f, err := os.OpenFile(candidate, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o666)
+	if err != nil {
+		return abort(err)
+	}
+	if _, err := f.Write(encodeSnapshot(payload)); err != nil {
+		_ = f.Close()
+		return abort(err)
+	}
+	// Flush the candidate to stable storage before reading it back.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return abort(err)
+	}
+	if err := f.Close(); err != nil {
+		return abort(err)
+	}
+
+	// Promote the candidate only once its checksum verifies and the whole
+	// payload decodes.
+	if _, err := verifySnapshotFile(candidate); err != nil {
+		return abort(err)
+	}
+
+	if err := os.Rename(candidate, filename); err != nil {
+		return abort(err)
+	}
+	syncSnapshotDir(l.logger, filepath.Dir(filename))
+
+	generation := l.generation.Add(1)
+	l.logger.Debug("notification log snapshot committed", "generation", generation, "size", len(payload))
+
+	return int64(len(payload)), nil
+}
+
+// recoverSnapshotFile resolves a snapshot generation left behind by a
+// previous process. A complete, valid candidate is promoted over the current
+// snapshot; an incomplete or corrupt candidate is removed while the last
+// valid snapshot is preserved. Stale temporary files left by older
+// Alertmanager versions ("<snapshot>.<random>") are cleaned up as well.
+func (l *Log) recoverSnapshotFile(filename string) error {
+	candidate := snapshotCandidatePath(filename)
+
+	if _, err := os.Stat(candidate); err == nil {
+		if _, verr := verifySnapshotFile(candidate); verr != nil {
+			l.logger.Warn("discarding incomplete notification log snapshot candidate", "file", candidate, "err", verr)
+			if err := os.Remove(candidate); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("removing corrupt snapshot candidate: %w", err)
+			}
+		} else if err := os.Rename(candidate, filename); err != nil {
+			return fmt.Errorf("recovering snapshot candidate: %w", err)
+		} else {
+			l.logger.Info("recovered notification log snapshot from completed candidate", "file", filename)
+			syncSnapshotDir(l.logger, filepath.Dir(filename))
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspecting snapshot candidate: %w", err)
+	}
+
+	l.removeStaleSnapshotFiles(filename, candidate)
+	return nil
+}
+
+// removeStaleSnapshotFiles removes temporary snapshot files that are neither
+// the committed snapshot nor its candidate. Only files using the legacy
+// random temp naming ("<snapshot>.<hex>") are removed, operator-managed files
+// are left untouched.
+func (l *Log) removeStaleSnapshotFiles(filename, candidate string) {
+	prefix := filename + "."
+	matches, err := filepath.Glob(prefix + "*")
+	if err != nil {
+		l.logger.Debug("listing stale snapshot files failed", "err", err)
+		return
+	}
+	for _, m := range matches {
+		if m == candidate {
+			continue
+		}
+		suffix, ok := strings.CutPrefix(m, prefix)
+		if !ok || !isLegacySnapshotTempSuffix(suffix) {
+			continue
+		}
+		if err := os.Remove(m); err != nil && !os.IsNotExist(err) {
+			l.logger.Debug("removing stale snapshot file failed", "file", m, "err", err)
+			continue
+		}
+		l.logger.Debug("removed stale snapshot file", "file", m)
+	}
+}
+
+// isLegacySnapshotTempSuffix reports whether name matches the random hex
+// suffix of temporary snapshot files written by older Alertmanager versions.
+func isLegacySnapshotTempSuffix(suffix string) bool {
+	if len(suffix) == 0 || len(suffix) > 16 {
+		return false
+	}
+	for _, r := range suffix {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// syncSnapshotDir flushes the directory entry for the snapshot rename so the
+// new generation survives a crash or power loss. Failures are non-fatal and
+// do not invalidate the already committed snapshot.
+func syncSnapshotDir(logger *slog.Logger, dir string) {
+	f, err := os.Open(dir)
+	if err != nil {
+		logger.Debug("opening snapshot directory for sync failed", "dir", dir, "err", err)
+		return
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		logger.Debug("syncing snapshot directory failed", "dir", dir, "err", err)
+	}
 }

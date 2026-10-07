@@ -1,0 +1,16 @@
+项目：prometheus-alertmanager｜题目 ID：prometheus-alertmanager-87dd061e-3a02-483f-ba5e-e6016c6a7f23
+固定基线：b9407e4c8d4c14ccb030301f7d1529eb39fbb2af｜Session：586499748533644:078b12cc5a37ea9af84b5abbbaa32af8_6ac6042f7e3ad4c77d0fe010.6ac6042f7e3ad4c77d0fe013.6ac6042f7e3ad4c77d0fe011:TraeCode CN.3.3.104.no_sid.no_ppe.T(2026/10/7 16:34:55)
+Harness：Trae｜有效轮数：47｜来源：count-trae-cn-steps.py｜范围：latest_turn
+完成度：完成｜收录结论：不收录
+验证命令：go test -count=1 ./nflog
+
+Rubric ID：1｜状态：通过｜期望行为：快照固定 receiver、group key、firing/resolved/muted 条目和 expiry 的同一代际。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：nflog/nflog.go; nflog/nflog_test.go；go test -count=1 ./nflog
+Rubric ID：2｜状态：通过｜期望行为：候选完成编码、过期裁剪和完整性校验后才替换当前日志。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：nflog/nflog.go; nflog/nflog_test.go；go test -count=1 ./nflog
+Rubric ID：3｜状态：通过｜期望行为：快照写入、同步或进程退出失败时上一份日志仍能完成去重查询。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：nflog/nflog.go; nflog/nflog_test.go；go test -count=1 ./nflog
+Rubric ID：4｜状态：通过｜期望行为：重启会继续或清理候选，最近已确认通知不会因快照丢失而重复发送。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：nflog/nflog.go; nflog/nflog_test.go；go test -count=1 ./nflog
+Rubric ID：5｜状态：通过｜期望行为：HA Merge 只接受较新且未过期的条目，迟到旧快照不能回退状态。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：nflog/nflog.go; nflog/nflog_test.go；go test -count=1 ./nflog
+Rubric ID：6｜状态：通过｜期望行为：GC、Query 和 DedupStage 不会读取半快照或混合内存候选。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：nflog/nflog.go; nflog/nflog_test.go；go test -count=1 ./nflog
+Rubric ID：7｜状态：通过｜期望行为：空日志、receiver/group key、集群协议和正常通知发送保持兼容。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：nflog/nflog.go; nflog/nflog_test.go；go test -count=1 ./nflog
+
+Prompt-Rubric 对齐：冻结 Prompt 已拆分为入口、状态、失败恢复、重启、并发和兼容性要求；每条 Rubric 均可回指原始 Prompt，未增加接口、文件、错误码、性能或部署条件。
+审计边界：仅使用本题固定版本、一次 Session、冻结 Rubric 和当前项目改动；未使用其他题目、其他 Session 或重跑材料替代原始运行事实。
