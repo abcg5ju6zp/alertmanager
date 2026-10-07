@@ -1,0 +1,16 @@
+项目：prometheus-alertmanager｜题目 ID：prometheus-alertmanager-17fd523c-38f3-49ca-8e10-928964174138
+固定基线：b9407e4c8d4c14ccb030301f7d1529eb39fbb2af｜Session：586499748533644:454c424dc1050019b35b8f34ce7b46cf_6ac6042e7e3ad4c77d0fe005.6ac6042e7e3ad4c77d0fe008.6ac6042e7e3ad4c77d0fe006:TraeCode CN.3.3.104.no_sid.no_ppe.T(2026/10/7 16:34:54)
+Harness：Trae｜有效轮数：251｜来源：count-trae-cn-steps.py｜范围：latest_turn
+完成度：完成｜收录结论：收录：长程题
+验证命令：go test -count=1 ./silence
+
+Rubric ID：1｜状态：通过｜期望行为：新建或修改 silence 先校验 matcher、时间、大小和数量限制。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：silence/silence.go; silence/tx.go; silence/journal.go; silence/tx_test.go；go test -count=1 ./silence
+Rubric ID：2｜状态：通过｜期望行为：state、matcher index 和快照只有在同一代际确认后才对 Query 与 Silencer 可见。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：silence/silence.go; silence/tx.go; silence/journal.go; silence/tx_test.go；go test -count=1 ./silence
+Rubric ID：3｜状态：通过｜期望行为：写入、快照、GC 或进程失败时上一有效规则继续抑制告警。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：silence/silence.go; silence/tx.go; silence/journal.go; silence/tx_test.go；go test -count=1 ./silence
+Rubric ID：4｜状态：通过｜期望行为：重启不会加载半写或已过期候选，未确认操作能继续或清理。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：silence/silence.go; silence/tx.go; silence/journal.go; silence/tx_test.go；go test -count=1 ./silence
+Rubric ID：5｜状态：通过｜期望行为：同一 ID 的并发更新按可比较版本收敛，迟到旧状态不能复活规则。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：silence/silence.go; silence/tx.go; silence/journal.go; silence/tx_test.go；go test -count=1 ./silence
+Rubric ID：6｜状态：通过｜期望行为：HA Merge、GC 和限制检查不会删除仍被确认新版本引用的 silence。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：silence/silence.go; silence/tx.go; silence/journal.go; silence/tx_test.go；go test -count=1 ./silence
+Rubric ID：7｜状态：通过｜期望行为：API、旧快照格式、通知抑制和空集合行为保持兼容。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：silence/silence.go; silence/tx.go; silence/journal.go; silence/tx_test.go；go test -count=1 ./silence
+
+Prompt-Rubric 对齐：冻结 Prompt 已拆分为入口、状态、失败恢复、重启、并发和兼容性要求；每条 Rubric 均可回指原始 Prompt，未增加接口、文件、错误码、性能或部署条件。
+审计边界：仅使用本题固定版本、一次 Session、冻结 Rubric 和当前项目改动；未使用其他题目、其他 Session 或重跑材料替代原始运行事实。

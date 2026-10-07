@@ -650,13 +650,17 @@ func TestSilencesSetSilence(t *testing.T) {
 		close(done)
 	}
 
-	// setSilence() is always called with s.mtx locked() in the application code
+	// applyCandidates() is always called with s.mtx locked() in the application code
+	var frames [][]byte
 	func() {
 		s.mtx.Lock()
 		defer s.mtx.Unlock()
-		_, _, err := s.setSilence(s.toMeshSilence(sil), nowpb)
+		_, frames, err = s.applyCandidates([]*pb.MeshSilence{s.toMeshSilence(sil)})
 		require.NoError(t, err)
 	}()
+	// Broadcasts are sent by the caller after releasing the lock.
+	s.broadcastFrames(frames)
+	require.NotEmpty(t, frames)
 
 	// Ensure broadcast was called.
 	if _, isOpen := <-done; isOpen {

@@ -346,6 +346,25 @@ type Silences struct {
 	mi        matcherIndex
 	vi        versionIndex
 	recorder  eventrecorder.Recorder
+
+	// snapFile is the configured durable snapshot path. When empty the
+	// Silences run in pure in-memory mode and no journal is maintained.
+	snapFile string
+	// jrnl holds recoverable candidate operations until their snapshot is
+	// confirmed.
+	jrnl *journal
+
+	// snapshotFault, when non-nil, replaces the durable snapshot write of a
+	// commit and may fail to inject snapshot failures in tests.
+	snapshotFault func() error
+	// crashHook, when non-nil, is invoked after the PENDING records and
+	// after the snapshot replacement of a commit. Returning an error aborts
+	// the commit before publication, simulating a process crash.
+	crashHook func(stage string) error
+	// maintenanceHook, when non-nil, runs while the maintenance snapshot
+	// critical section is held. It exists to test that writers cannot rename
+	// a snapshot concurrently with the maintenance replacement.
+	maintenanceHook func()
 }
 
 // Limits contains the limits for silences.
@@ -546,6 +565,7 @@ func New(o Options) (*Silences, error) {
 	}
 
 	if o.SnapshotFile != "" {
+		s.snapFile = o.SnapshotFile
 		if r, err := os.Open(o.SnapshotFile); err != nil {
 			if !os.IsNotExist(err) {
 				return nil, err
@@ -560,6 +580,33 @@ func New(o Options) (*Silences, error) {
 	if o.SnapshotReader != nil {
 		if err := s.loadSnapshot(o.SnapshotReader); err != nil {
 			return s, err
+		}
+	}
+
+	if s.snapFile != "" {
+		// The candidate journal makes every committed lifecycle change
+		// recoverable: a PENDING operation is replayed at startup until its
+		// snapshot has been confirmed.
+		jrnl, err := openJournal(s.snapFile + journalFileSuffix)
+		if err != nil {
+			return nil, err
+		}
+		s.jrnl = jrnl
+
+		if jrnl.baseline() > 0 {
+			// The journal only advances its baseline once the matching
+			// snapshot durably contains those operations, so a missing
+			// snapshot here means confirmed state was lost externally.
+			if _, err := os.Stat(s.snapFile); errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("silences snapshot file %q is missing despite confirmed journal state", s.snapFile)
+			}
+		}
+
+		// Continue operations that never reached their confirmation before
+		// the last shutdown, so that queries and the notification pipeline
+		// only ever start from a consistent recovered set.
+		if err := s.recoverCandidates(); err != nil {
+			return nil, err
 		}
 	}
 	return s, nil
@@ -601,15 +648,42 @@ func (s *Silences) Maintenance(interval time.Duration, snapf string, stopc <-cha
 		if snapf == "" {
 			return size, nil
 		}
+
+		// The whole snapshot replacement must be serialized against the
+		// rename performed by a committing Set/Expire/GC/Merge. Otherwise a
+		// maintenance snapshot marshaled before a commit could be renamed
+		// over the file after the commit, rolling the confirmed snapshot
+		// back to stale bytes while the journal already marks the operation
+		// confirmed - an unrecoverable loss after restart. Readers keep
+		// concurrent access; only writers are blocked for one fsync cycle.
+		s.mtx.RLock()
+		defer s.mtx.RUnlock()
+
 		f, err := openReplace(snapf)
 		if err != nil {
 			return size, err
 		}
-		if size, err = s.Snapshot(f); err != nil {
-			f.Close()
+		if size, err = snapshotState(f, s.st); err != nil {
+			_ = f.discard()
 			return size, err
 		}
-		return size, f.Close()
+		if s.maintenanceHook != nil {
+			// Test hook invoked while the snapshot critical section is held.
+			s.maintenanceHook()
+		}
+		if err := f.Close(); err != nil {
+			_ = f.discard()
+			return size, err
+		}
+		// The snapshot now contains every confirmed operation, so compact
+		// the journal. Unconfirmed candidates are retained. The journal
+		// lock order (s.mtx then journal lock) matches the commit path.
+		if s.jrnl != nil && snapf == s.snapFile {
+			if err := s.jrnl.checkpointConfirmed(); err != nil {
+				return size, fmt.Errorf("compact silence journal: %w", err)
+			}
+		}
+		return size, nil
 	}
 
 	if override != nil {
@@ -652,67 +726,32 @@ Loop:
 }
 
 // GC runs a garbage collection that removes silences that have ended longer
-// than the configured retention time ago.
+// than the configured retention time ago. The deletions are committed with
+// the same durability pipeline as other lifecycle changes, so they cannot be
+// resurrected by a crash between garbage collection and snapshotting.
 func (s *Silences) GC() (int, error) {
 	start := time.Now()
 	defer func() { s.metrics.gcDuration.Observe(time.Since(start).Seconds()) }()
 
 	now := s.nowUTC()
-	var n int
-	var errs error
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	// During GC we will delete expired silences from the state map and the indices.
-	// If between the last GC's deletion, and including any silences that were added
-	// until now, we have more than 50% spare capacity, we want to reallocate to a smaller
-	// slice, while still leaving some growth buffer.
-	needsRealloc := cap(s.vi) > 1024 && len(s.vi) < cap(s.vi)/2
+	ws := s.newWorkState()
+	plan := ws.planGC(now, s.pendingReferences(), s)
 
-	var targetVi versionIndex
-	if needsRealloc {
-		// Allocate new slice with growth buffer.
-		newCap := max(len(s.vi)*5/4, 1024)
-		targetVi = make(versionIndex, 0, newCap)
+	if plan.n > 0 {
+		if err := s.publishDurable(ws, nil, plan.ids); err != nil {
+			return 0, err
+		}
 	} else {
-		targetVi = s.vi[:0]
+		// Even without deletions the working copy may have reallocated or
+		// compacted the version index.
+		s.publish(ws)
 	}
 
-	// Iterate state map directly (fast - no extra lookups).
-	for _, sv := range s.vi {
-		sil, ok := s.st[sv.id]
-		expire := false
-		if !ok {
-			// Silence in version index but not in state - remove from version index and count error
-			s.metrics.gcErrorsTotal.Inc()
-			errs = errors.Join(errs, fmt.Errorf("silence %s in version index missing from state", sv.id))
-			// not adding to targetVi effectively removes it
-			continue
-		}
-		if sil.ExpiresAt == nil || sil.ExpiresAt.AsTime().IsZero() {
-			// Invalid expiration timestamp - remove silence and count error
-			s.metrics.gcErrorsTotal.Inc()
-			errs = errors.Join(errs, fmt.Errorf("silence %s has zero expiration timestamp", sil.Silence.Id))
-			expire = true
-		}
-		if expire || !sil.ExpiresAt.AsTime().After(now) {
-			delete(s.st, sil.Silence.Id)
-			delete(s.mi, sil.Silence.Id)
-			n++
-		} else {
-			targetVi = append(targetVi, sv)
-		}
-	}
-
-	if !needsRealloc {
-		// If we didn't reallocate, clear tail to prevent string pointer leaks
-		clear(s.vi[len(targetVi):])
-	}
-	s.vi = targetVi
-	s.updateSizeMetrics()
-
-	return n, errs
+	return plan.n, plan.errs
 }
 
 func validateMatcher(m *pb.Matcher) error {
@@ -823,20 +862,58 @@ func (s *Silences) toMeshSilence(sil *pb.Silence) *pb.MeshSilence {
 	}
 }
 
-func (s *Silences) setSilence(msil *pb.MeshSilence, now time.Time) (changed, added bool, err error) {
-	b, err := marshalMeshSilence(msil)
-	if err != nil {
-		return false, false, err
+// expiredCopy returns a copy of sil moved into the expired state at now.
+func expiredCopy(sil *pb.Silence, now time.Time) *pb.Silence {
+	out := cloneSilence(sil)
+	switch getState(out, now) {
+	case SilenceStateExpired:
+	case SilenceStateActive:
+		out.EndsAt = timestamppb.New(now)
+	case SilenceStatePending:
+		// Set both to now to make Silence move to "expired" state.
+		out.StartsAt = timestamppb.New(now)
+		out.EndsAt = timestamppb.New(now)
 	}
-	changed, added = s.st.merge(msil, now)
-	if added {
-		s.indexSilence(msil.Silence)
-		s.updateSizeMetrics()
+	out.UpdatedAt = timestamppb.New(now)
+	return out
+}
+
+// applyCandidates applies the candidate upserts to a fresh working copy and
+// runs the durable commit pipeline. Only entries that actually changed the
+// working copy are journaled. The returned frames are the legacy-format
+// gossip bytes to broadcast by the caller after releasing s.mtx.
+func (s *Silences) applyCandidates(candidates []*pb.MeshSilence) (winners []*pb.MeshSilence, frames [][]byte, err error) {
+	ws := s.newWorkState()
+	winners = make([]*pb.MeshSilence, 0, len(candidates))
+	for _, msil := range candidates {
+		added, replaced := ws.upsert(msil, s)
+		if added || replaced {
+			winners = append(winners, msil)
+		}
 	}
-	if changed {
+	if len(winners) == 0 {
+		return nil, nil, nil
+	}
+	// Prepare the gossip frames before the durable pipeline: a marshal
+	// failure must abort the commit without leaving a candidate behind.
+	frames = make([][]byte, 0, len(winners))
+	for _, msil := range winners {
+		b, merr := marshalMeshSilence(msil)
+		if merr != nil {
+			return nil, nil, merr
+		}
+		frames = append(frames, b)
+	}
+	if err := s.publishDurable(ws, winners, nil); err != nil {
+		return nil, nil, err
+	}
+	return winners, frames, nil
+}
+
+func (s *Silences) broadcastFrames(frames [][]byte) {
+	for _, b := range frames {
 		s.broadcast(b)
 	}
-	return changed, added, nil
 }
 
 // Set the specified silence. If a silence with the ID already exists and the modification
@@ -854,81 +931,99 @@ func (s *Silences) Set(ctx context.Context, sil *pb.Silence) error {
 		return fmt.Errorf("invalid silence: %w", err)
 	}
 
+	frames, created, updated, err := s.setTx(sil, now)
+	if err != nil {
+		return err
+	}
+
+	// Broadcast and event recording happen outside the write lock.
+	s.broadcastFrames(frames)
+	if created != nil && len(frames) > 0 {
+		s.recorder.RecordEvent(ctx, func() eventrecorder.EventData {
+			return eventrecorder.NewSilenceCreatedEvent(created)
+		})
+	}
+	if updated != nil && len(frames) > 0 {
+		s.recorder.RecordEvent(ctx, func() eventrecorder.EventData {
+			return eventrecorder.NewSilenceUpdatedEvent(updated)
+		})
+	}
+	return nil
+}
+
+// setTx builds and commits the candidate batch for a Set call. It returns the
+// gossip frames to broadcast and, when applicable, the created or updated
+// silence payload for event recording.
+func (s *Silences) setTx(sil *pb.Silence, now time.Time) (frames [][]byte, created, updated *pb.Silence, err error) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
 	prev, ok := s.getSilence(sil.Id)
 	if sil.Id != "" && !ok {
-		return ErrNotFound
+		return nil, nil, nil, ErrNotFound
 	}
+
+	var candidates []*pb.MeshSilence
 
 	if ok && canUpdate(prev, sil, now) {
 		sil.UpdatedAt = timestamppb.New(now)
 		msil := s.toMeshSilence(sil)
 		if err := s.checkSizeLimits(msil); err != nil {
-			return err
+			return nil, nil, nil, err
 		}
 		if s.logging {
 			s.logSilence("update silence", sil)
 		}
-		changed, _, err := s.setSilence(msil, now)
+		candidates = append(candidates, msil)
+		updated = sil
+	} else {
+		// If we got here it's either a new silence or a replacing one (which
+		// would also create a new silence) so we need to make sure we have
+		// capacity for the new silence. Unconfirmed candidates from failed
+		// commits count too, otherwise retrying after a failed snapshot could
+		// accept more silences than the limit allows.
+		if s.limits.MaxSilences != nil {
+			total := len(s.st) + s.pendingNewSilenceCount() + 1
+			if m := s.limits.MaxSilences(); m > 0 && total > m {
+				return nil, nil, nil, fmt.Errorf("exceeded maximum number of silences: %d (limit: %d)", total-1, m)
+			}
+		}
+
+		uid, err := uuid.NewRandom()
 		if err != nil {
-			return err
+			return nil, nil, nil, fmt.Errorf("generate uuid: %w", err)
 		}
-		if changed {
-			s.recorder.RecordEvent(ctx, func() eventrecorder.EventData {
-				return eventrecorder.NewSilenceUpdatedEvent(sil)
-			})
+		sil.Id = uid.String()
+
+		if sil.StartsAt.AsTime().Before(now) {
+			sil.StartsAt = timestamppb.New(now)
 		}
-		return nil
+		sil.UpdatedAt = timestamppb.New(now)
+
+		msil := s.toMeshSilence(sil)
+		if err := s.checkSizeLimits(msil); err != nil {
+			return nil, nil, nil, err
+		}
+
+		if ok && getState(prev, now) != SilenceStateExpired {
+			// We cannot update the silence, expire the old one to leave a
+			// history of the silence before modification. Both changes are
+			// committed as a single atomic candidate batch.
+			candidates = append(candidates, s.toMeshSilence(expiredCopy(prev, now)))
+		}
+
+		if s.logging {
+			s.logSilence("create silence", sil)
+		}
+		candidates = append(candidates, msil)
+		created = sil
 	}
 
-	// If we got here it's either a new silence or a replacing one (which would
-	// also create a new silence) so we need to make sure we have capacity for
-	// the new silence.
-	if s.limits.MaxSilences != nil {
-		if m := s.limits.MaxSilences(); m > 0 && len(s.st)+1 > m {
-			return fmt.Errorf("exceeded maximum number of silences: %d (limit: %d)", len(s.st), m)
-		}
-	}
-
-	uid, err := uuid.NewRandom()
+	_, frames, err = s.applyCandidates(candidates)
 	if err != nil {
-		return fmt.Errorf("generate uuid: %w", err)
+		return nil, nil, nil, err
 	}
-	sil.Id = uid.String()
-
-	if sil.StartsAt.AsTime().Before(now) {
-		sil.StartsAt = timestamppb.New(now)
-	}
-	sil.UpdatedAt = timestamppb.New(now)
-
-	msil := s.toMeshSilence(sil)
-	if err := s.checkSizeLimits(msil); err != nil {
-		return err
-	}
-
-	if ok && getState(prev, s.nowUTC()) != SilenceStateExpired {
-		// We cannot update the silence, expire the old one to leave a history of
-		// the silence before modification.
-		if err := s.expire(prev.Id); err != nil {
-			return fmt.Errorf("expire previous silence: %w", err)
-		}
-	}
-
-	if s.logging {
-		s.logSilence("create silence", sil)
-	}
-	_, added, err := s.setSilence(msil, now)
-	if err != nil {
-		return err
-	}
-	if added {
-		s.recorder.RecordEvent(ctx, func() eventrecorder.EventData {
-			return eventrecorder.NewSilenceCreatedEvent(sil)
-		})
-	}
-	return nil
+	return frames, created, updated, nil
 }
 
 // canUpdate returns true if silence a can be updated to b without
@@ -962,44 +1057,40 @@ func canUpdate(a, b *pb.Silence, now time.Time) bool {
 
 // Expire the silence with the given ID immediately.
 func (s *Silences) Expire(ctx context.Context, id string) error {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
 	_, span := tracer.Start(ctx, "silences.Expire", trace.WithAttributes(
 		attribute.String("alerting.silence.id", id),
 	))
 	defer span.End()
 
-	return s.expire(id)
+	s.mtx.Lock()
+	frames, err := s.expireLocked(id)
+	s.mtx.Unlock()
+	if err != nil {
+		return err
+	}
+	s.broadcastFrames(frames)
+	return nil
 }
 
-// Expire the silence with the given ID immediately.
+// expireLocked builds and commits the expiry candidate. It returns the gossip
+// frames to broadcast after releasing s.mtx.
 // It is idempotent, nil is returned if the silence already expired before it is GC'd.
 // If the silence is not found an error is returned.
-func (s *Silences) expire(id string) error {
+func (s *Silences) expireLocked(id string) ([][]byte, error) {
 	sil, ok := s.getSilence(id)
 	if !ok {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
-	sil = cloneSilence(sil)
 	now := s.nowUTC()
-
-	switch getState(sil, now) {
-	case SilenceStateExpired:
-		return nil
-	case SilenceStateActive:
-		sil.EndsAt = timestamppb.New(now)
-	case SilenceStatePending:
-		// Set both to now to make Silence move to "expired" state
-		sil.StartsAt = timestamppb.New(now)
-		sil.EndsAt = timestamppb.New(now)
+	if getState(sil, now) == SilenceStateExpired {
+		return nil, nil
 	}
-	sil.UpdatedAt = timestamppb.New(now)
+	expired := expiredCopy(sil, now)
 	if s.logging {
-		s.logSilence("expire silence", sil)
+		s.logSilence("expire silence", expired)
 	}
-	_, _, err := s.setSilence(s.toMeshSilence(sil), now)
-	return err
+	_, frames, err := s.applyCandidates([]*pb.MeshSilence{s.toMeshSilence(expired)})
+	return frames, err
 }
 
 // QueryParam expresses parameters along which silences are queried.
@@ -1279,12 +1370,7 @@ func (s *Silences) Snapshot(w io.Writer) (int64, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
-	b, err := s.st.MarshalBinary()
-	if err != nil {
-		return 0, err
-	}
-
-	return io.Copy(w, bytes.NewReader(b))
+	return snapshotState(w, s.st)
 }
 
 // MarshalBinary serializes all silences.
@@ -1296,34 +1382,56 @@ func (s *Silences) MarshalBinary() ([]byte, error) {
 }
 
 // Merge merges silence state received from the cluster with the local state.
+// All accepted entries are committed as a single durable candidate batch and
+// the received message is propagated to other peers only afterwards.
 func (s *Silences) Merge(b []byte) error {
-	st, err := decodeState(bytes.NewReader(b))
+	incoming, err := decodeState(bytes.NewReader(b))
 	if err != nil {
 		return err
 	}
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
 
 	now := s.nowUTC()
 
-	for _, e := range st {
-		merged, added := s.st.merge(e, now)
-		if merged {
-			if added {
-				s.indexSilence(e.Silence)
-			}
-			if !cluster.OversizedMessage(b) {
-				// If this is the first we've seen the message and it's
-				// not oversized, gossip it to other nodes. We don't
-				// propagate oversized messages because they're sent to
-				// all nodes already.
-				s.broadcast(b)
-				s.metrics.propagatedMessagesTotal.Inc()
-				s.logger.Debug("Gossiping new silence", "silence", e)
-			}
+	s.mtx.Lock()
+	ws := s.newWorkState()
+	winners := make([]*pb.MeshSilence, 0, len(incoming))
+	for _, e := range incoming {
+		// Comments list was moved to a single comment. Apply upgrade
+		// on silences received from peers.
+		if len(e.Silence.Comments) > 0 {
+			e.Silence.Comment = e.Silence.Comments[0].Comment
+			e.Silence.CreatedBy = e.Silence.Comments[0].Author
+			e.Silence.Comments = nil
+		}
+		if e.ExpiresAt.AsTime().Before(now) {
+			continue
+		}
+		added, replaced := ws.upsert(e, s)
+		if added || replaced {
+			winners = append(winners, e)
 		}
 	}
-	s.updateSizeMetrics()
+
+	if len(winners) == 0 {
+		s.mtx.Unlock()
+		return nil
+	}
+	if err := s.publishDurable(ws, winners, nil); err != nil {
+		s.mtx.Unlock()
+		return err
+	}
+	propagate := !cluster.OversizedMessage(b)
+	s.mtx.Unlock()
+
+	if propagate {
+		// If this is the first we've seen the message and it's
+		// not oversized, gossip it to other nodes. We don't
+		// propagate oversized messages because they're sent to
+		// all nodes already.
+		s.broadcast(b)
+		s.metrics.propagatedMessagesTotal.Inc()
+		s.logger.Debug("Gossiping new silences", "count", len(winners))
+	}
 	return nil
 }
 
@@ -1354,7 +1462,7 @@ func (s state) merge(e *pb.MeshSilence, now time.Time) (bool, bool) {
 	}
 
 	prev, ok := s[id]
-	if !ok || prev.Silence.UpdatedAt.AsTime().Before(e.Silence.UpdatedAt.AsTime()) {
+	if !ok || silenceNewer(prev, e) {
 		s[id] = e
 		return true, !ok
 	}
@@ -1447,6 +1555,25 @@ func (f *replaceFile) Close() error {
 		return err
 	}
 	return os.Rename(f.Name(), f.filename)
+}
+
+// abort discards a replaceFile without ever renaming it over the target
+// snapshot. It must be used when writing the temporary file failed, so that a
+// partial or empty snapshot can never replace the last confirmed one.
+func (f *replaceFile) abort() error {
+	return f.discard()
+}
+
+// discard closes the underlying descriptor without renaming and removes the
+// temporary file. It is safe after Close failed (the descriptor may already
+// be closed) and when the rename did not happen.
+func (f *replaceFile) discard() error {
+	name := f.Name()
+	if err := f.File.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+		// Still remove the temp file below.
+		_ = err
+	}
+	return os.Remove(name)
 }
 
 // openReplace opens a new temporary file that is moved to filename on closing.

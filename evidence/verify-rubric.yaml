@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "新建或修改 silence 先校验 matcher、时间、大小和数量限制。"
+  - id: 2
+    type: f2p
+    text: "state、matcher index 和快照只有在同一代际确认后才对 Query 与 Silencer 可见。"
+  - id: 3
+    type: f2p
+    text: "写入、快照、GC 或进程失败时上一有效规则继续抑制告警。"
+  - id: 4
+    type: f2p
+    text: "重启不会加载半写或已过期候选，未确认操作能继续或清理。"
+  - id: 5
+    type: f2p
+    text: "同一 ID 的并发更新按可比较版本收敛，迟到旧状态不能复活规则。"
+  - id: 6
+    type: p2p
+    text: "HA Merge、GC 和限制检查不会删除仍被确认新版本引用的 silence。"
+  - id: 7
+    type: p2p
+    text: "API、旧快照格式、通知抑制和空集合行为保持兼容。"
